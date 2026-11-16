@@ -238,7 +238,7 @@ export default function AuthScreen({ recovery = false }) {
               <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required/></label>
               <label>Phone number<input type="tel" autoComplete="tel" value={phone} onChange={(event) => setPhone(event.target.value)} required placeholder="+2348012345678"/></label>
               <label>Date of birth<input type="date" value={dateOfBirth} onChange={(event) => setDateOfBirth(event.target.value)} required max={new Date().toISOString().slice(0, 10)}/></label>
-              <label>Gender<select value={gender} onChange={(event) => setGender(event.target.value)} required><option value="">Select</option><option value="female">Female</option><option value="male">Male</option><option value="non_binary">Non-binary</option><option value="prefer_not_to_say">Prefer not to say</option></select></label>
+              <label>Gender<select value={gender} onChange={(event) => setGender(event.target.value)} required><option value="">Select</option><option value="female">Female</option><option value="male">Male</option></select></label>
             </>}
             {mode === "login" && <label>Email or phone number<input autoComplete="username" value={identifier} onChange={(event) => setIdentifier(event.target.value)} required/></label>}
             {mode === "recover" && <label>Email or phone number<input autoComplete="username" value={identifier} onChange={(event) => setIdentifier(event.target.value)} required/></label>}

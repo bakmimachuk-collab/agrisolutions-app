@@ -191,7 +191,7 @@ function Layout({ children, crops, livestock, alerts, onAddCrop, onAddLivestock 
         </header>
         <div className={`page ${location.pathname === "/ask-ai" ? "page-chat" : ""}`}>
           {!configured&&<div className="backend-notice" role="status">Supabase is not configured. This session uses this browser only; accounts, cloud backups, and cross-device sync are unavailable.</div>}
-          {configured&&user&&<div className="account-bar"><span>Signed in as {user.email||user.phone}. Calendar, community, crop/livestock records, and notifications use Supabase; AI conversations and diagnosis history are not yet cloud-backed.</span><button className="auth-link" onClick={async()=>{const result=await signOut();if(result?.error)setAuthError(result.error.message);}}>Sign out</button>{authError&&<span role="alert">{authError}</span>}</div>}
+          {configured&&user&&<div className="account-bar"><span>Signed in as {user.email||user.phone}. Calendar, community, crop/livestock records, notifications, and AI conversation history use Supabase; diagnosis history is not yet cloud-backed.</span><button className="auth-link" onClick={async()=>{const result=await signOut();if(result?.error)setAuthError(result.error.message);}}>Sign out</button>{authError&&<span role="alert">{authError}</span>}</div>}
           {children}
         </div>
         <div className="mobile-nav">
@@ -376,9 +376,70 @@ function readAIConversations(key) {
     .sort((first,second)=>(second.updatedAt||0)-(first.updatedAt||0));
 }
 
+function createConversationId() {
+  if(globalThis.crypto?.randomUUID)return globalThis.crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,character=>{
+    const random=Math.floor(Math.random()*16);
+    return (character==="x"?random:(random&0x3)|0x8).toString(16);
+  });
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value||"");
+}
+
+function normalizeConversation(conversation) {
+  const id=isUuid(conversation.id)?conversation.id:createConversationId();
+  return {
+    ...conversation,
+    id,
+    messages:conversation.messages.map(message=>message.isWelcome?message:{
+      ...message,
+      id:isUuid(message.id)?message.id:createConversationId(),
+      createdAt:message.createdAt||new Date().toISOString()
+    })
+  };
+}
+
+function asISOString(value) {
+  const date=new Date(value||Date.now());
+  return Number.isNaN(date.getTime())?new Date().toISOString():date.toISOString();
+}
+
+async function saveConversationToCloud(client,userId,conversation) {
+  const updatedAt=asISOString(conversation.updatedAt);
+  const {error:conversationError}=await client.from("conversations").upsert({
+    id:conversation.id,
+    user_id:userId,
+    title:conversation.title,
+    updated_at:updatedAt
+  },{onConflict:"id"});
+  if(conversationError)throw conversationError;
+
+  const messages=conversation.messages.filter(message=>!message.isWelcome&&["ai","user"].includes(message.role));
+  const rows=messages.map(message=>({
+    id:message.id,
+    conversation_id:conversation.id,
+    user_id:userId,
+    role:message.role==="ai"?"assistant":"user",
+    content:message.text,
+    created_at:asISOString(message.createdAt)
+  }));
+  if(!rows.length)return;
+
+  const {error:messagesError}=await client.from("messages").upsert(rows,{onConflict:"id"});
+  if(messagesError)throw messagesError;
+
+  const messageIds=rows.map(message=>message.id);
+  const {error:deleteError}=await client.from("messages").delete()
+    .eq("conversation_id",conversation.id)
+    .not("id","in",`(${messageIds.join(",")})`);
+  if(deleteError)throw deleteError;
+}
+
 function AskAI({onSaveRecommendation}) {
   const {language,aiLanguage,t}=useLanguage();
-  const {user}=useAuth();
+  const {user,client,loading:authLoading}=useAuth();
   const navigate=useNavigate();
   const storageKey=`agriplus-ai-history:${user?.id||"local"}`;
   const [initialState]=useState(()=>{
@@ -390,19 +451,132 @@ function AskAI({onSaveRecommendation}) {
   const [activeConversationId,setActiveConversationId]=useState(initialState.activeId);
   const [messages,setMessages]=useState(initialState.messages);
   const [input,setInput]=useState(""); const [busy,setBusy]=useState(false);
+  const [historyLoading,setHistoryLoading]=useState(true);
+  const [historyError,setHistoryError]=useState("");
   const messagesEndRef=useRef(null);
   const composerRef=useRef(null);
+  const syncTasks=useRef(new Map());
   useEffect(()=>{
-    writeStoredValue(storageKey,conversations);
-  },[storageKey,conversations]);
+    if(!historyLoading)writeStoredValue(storageKey,conversations);
+  },[storageKey,conversations,historyLoading]);
+  useEffect(()=>{
+    if(authLoading)return undefined;
+    let active=true;
+    const loadHistory=async()=>{
+      setHistoryLoading(true);
+      setHistoryError("");
+      const localConversations=readAIConversations(storageKey).map(normalizeConversation);
+      if(!user||!client){
+        if(active){
+          const current=localConversations[0];
+          setConversations(localConversations);
+          setActiveConversationId(current?.id||null);
+          setMessages(current?.messages||[{role:"ai",text:"Hello! I’m your MBs Agro Solution assistant. Tell me what is happening on your farm, and I’ll help you work through it step by step.",isWelcome:true}]);
+          setHistoryLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const {data:cloudRows,error:conversationError}=await client.from("conversations")
+          .select("id,title,updated_at")
+          .eq("user_id",user.id)
+          .order("updated_at",{ascending:false})
+          .limit(30);
+        if(conversationError)throw conversationError;
+
+        const cloudIds=(cloudRows||[]).map(conversation=>conversation.id);
+        let cloudMessages=[];
+        if(cloudIds.length){
+          const {data,error:messagesError}=await client.from("messages")
+            .select("id,conversation_id,role,content,created_at")
+            .in("conversation_id",cloudIds)
+            .order("created_at",{ascending:true});
+          if(messagesError)throw messagesError;
+          cloudMessages=data||[];
+        }
+
+        const messagesByConversation=new Map();
+        for(const row of cloudMessages){
+          const list=messagesByConversation.get(row.conversation_id)||[];
+          list.push({
+            id:row.id,
+            role:row.role==="assistant"?"ai":"user",
+            text:row.content,
+            createdAt:row.created_at,
+            fromApi:row.role==="assistant"
+          });
+          messagesByConversation.set(row.conversation_id,list);
+        }
+        const remoteConversations=(cloudRows||[]).map(row=>({
+          id:row.id,
+          title:row.title,
+          updatedAt:Date.parse(row.updated_at)||Date.now(),
+          messages:messagesByConversation.get(row.id)||[]
+        }));
+        const remoteIds=new Set(remoteConversations.map(conversation=>conversation.id));
+        const combined=[...remoteConversations,...localConversations.filter(conversation=>!remoteIds.has(conversation.id))]
+          .sort((first,second)=>second.updatedAt-first.updatedAt)
+          .slice(0,30);
+        let migrationFailed=false;
+        for(const conversation of combined){
+          if(remoteIds.has(conversation.id))continue;
+          try {
+            await saveConversationToCloud(client,user.id,conversation);
+          } catch(error) {
+            migrationFailed=true;
+            console.error("Could not back up an existing AI conversation.",error);
+          }
+        }
+        if(!active)return;
+        const current=combined[0];
+        setConversations(combined);
+        setActiveConversationId(current?.id||null);
+        setMessages(current?.messages||[{role:"ai",text:"Hello! I’m your MBs Agro Solution assistant. Tell me what is happening on your farm, and I’ll help you work through it step by step.",isWelcome:true}]);
+        if(migrationFailed)setHistoryError("Some saved chats could not be backed up. They are still available in this browser; check your Supabase configuration and try again.");
+      } catch(error) {
+        console.error("Could not load AI conversation history from Supabase.",error);
+        if(active){
+          const current=localConversations[0];
+          setConversations(localConversations);
+          setActiveConversationId(current?.id||null);
+          setMessages(current?.messages||[{role:"ai",text:"Hello! I’m your MBs Agro Solution assistant. Tell me what is happening on your farm, and I’ll help you work through it step by step.",isWelcome:true}]);
+          setHistoryError("Cloud chat history could not be loaded. Showing chats saved in this browser.");
+        }
+      } finally {
+        if(active)setHistoryLoading(false);
+      }
+    };
+    loadHistory();
+    return ()=>{active=false;};
+  },[authLoading,client,storageKey,user?.id]);
   useEffect(()=>{
     messagesEndRef.current?.scrollIntoView({behavior:"smooth",block:"end"});
   },[messages,busy]);
-  const storeConversation=(id,nextMessages)=>{
+  const syncConversation=conversation=>{
+    if(!user||!client)return Promise.resolve();
+    const previous=syncTasks.current.get(conversation.id)||Promise.resolve();
+    const task=previous.catch(()=>{}).then(async()=>{
+      try {
+        await saveConversationToCloud(client,user.id,conversation);
+        setHistoryError("");
+      } catch(error) {
+        console.error("Could not back up AI conversation.",error);
+        setHistoryError("Chat backup failed. This conversation is still saved in this browser.");
+      }
+    });
+    syncTasks.current.set(conversation.id,task);
+    task.then(()=>{
+      if(syncTasks.current.get(conversation.id)===task)syncTasks.current.delete(conversation.id);
+    });
+    return task;
+  };
+  const storeConversation=(id,nextMessages,sync=true)=>{
     const firstUserMessage=nextMessages.find(message=>message.role==="user");
     const title=(firstUserMessage?.text||t("New chat")).trim();
-    const conversation={id,title:title.length>48?`${title.slice(0,47)}…`:title,messages:nextMessages,updatedAt:Date.now()};
+    const conversation=normalizeConversation({id,title:title.length>48?`${title.slice(0,47)}…`:title,messages:nextMessages,updatedAt:Date.now()});
     setConversations(current=>[conversation,...current.filter(item=>item.id!==id)].slice(0,30));
+    return sync?syncConversation(conversation):Promise.resolve();
   };
   const startNewChat=()=>{
     setMessages([{role:"ai",text:t("Hello! I’m your MBs Agro Solution assistant. Tell me what is happening on your farm, and I’ll help you work through it step by step."),isWelcome:true}]);
@@ -415,10 +589,22 @@ function AskAI({onSaveRecommendation}) {
     setMessages(conversation.messages);
     setInput("");
   };
-  const deleteConversation=(event,id)=>{
+  const deleteConversation=async(event,id)=>{
     event.stopPropagation();
     if(busy)return;
+    if(user&&client){
+      try {
+        await syncTasks.current.get(id);
+        const {error}=await client.from("conversations").delete().eq("id",id).eq("user_id",user.id);
+        if(error)throw error;
+      } catch(error) {
+        console.error("Could not delete AI conversation from Supabase.",error);
+        setHistoryError("This chat could not be deleted from your account. Please try again.");
+        return;
+      }
+    }
     setConversations(current=>current.filter(conversation=>conversation.id!==id));
+    setHistoryError("");
     if(activeConversationId===id)startNewChat();
   };
   const useSuggestion=value=>{
@@ -427,10 +613,10 @@ function AskAI({onSaveRecommendation}) {
   };
   const send=async()=>{
     const q=input.trim();
-    if(!q||busy)return;
-    const userMessage={role:"user",text:q};
+    if(!q||busy||historyLoading)return;
+    const userMessage={id:createConversationId(),role:"user",text:q,createdAt:new Date().toISOString()};
     const conversation=[...messages,userMessage].slice(-20);
-    const conversationId=activeConversationId||globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random()}`;
+    const conversationId=activeConversationId||createConversationId();
     setActiveConversationId(conversationId);
     storeConversation(conversationId,conversation);
     const apiMessages=[...messages.filter(message=>!message.isWelcome),userMessage].slice(-20);
@@ -458,16 +644,16 @@ function AskAI({onSaveRecommendation}) {
       }
       if(!response.ok)throw new Error(result?.error||`${t("The AI API returned HTTP ")}${response.status}.`);
       if(typeof result?.text!=="string"||!result.text.trim())throw new Error(t("The AI API returned an empty reply. Check the server configuration and logs."));
-      const reply={id:`${Date.now()}`,role:"ai",text:result.text,fromApi:true};
+      const reply={id:createConversationId(),role:"ai",text:result.text,fromApi:true,createdAt:new Date().toISOString()};
       const updatedConversation=[...conversation,reply].slice(-20);
       setMessages(updatedConversation);
-      storeConversation(conversationId,updatedConversation);
+      await storeConversation(conversationId,updatedConversation);
     } catch(error) {
       const message=error instanceof Error?error.message:String(error);
-      const reply={role:"ai",text:`${t("Sorry, I couldn’t get a reply: ")}${t(message)}`};
+      const reply={id:createConversationId(),role:"ai",text:`${t("Sorry, I couldn’t get a reply: ")}${t(message)}`,createdAt:new Date().toISOString()};
       const updatedConversation=[...conversation,reply].slice(-20);
       setMessages(updatedConversation);
-      storeConversation(conversationId,updatedConversation);
+      await storeConversation(conversationId,updatedConversation);
     } finally {
       setBusy(false);
     }
@@ -477,13 +663,15 @@ function AskAI({onSaveRecommendation}) {
         <aside className="chat-history" aria-label={t("Chat history")}>
           <div className="chat-history-heading"><strong>{t("Chat history")}</strong><span>{conversations.length}</span></div>
           {conversations.length===0?<p className="chat-history-empty">{t("No saved chats yet.")}</p>:<div className="chat-history-list">{conversations.map(conversation=><div className={`chat-history-row ${activeConversationId===conversation.id?"active":""}`} key={conversation.id}>
-            <button type="button" className="chat-history-select" onClick={()=>openConversation(conversation)} disabled={busy} aria-current={activeConversationId===conversation.id?"page":undefined}><span>{conversation.title}</span><small>{new Intl.DateTimeFormat("en-NG",{month:"short",day:"numeric"}).format(new Date(conversation.updatedAt))}</small></button>
-            <button type="button" className="chat-history-delete" onClick={event=>deleteConversation(event,conversation.id)} disabled={busy} title={t("Delete chat")} aria-label={`${t("Delete chat")}: ${conversation.title}`}><Trash2 size={15}/></button>
+            <button type="button" className="chat-history-select" onClick={()=>openConversation(conversation)} disabled={busy||historyLoading} aria-current={activeConversationId===conversation.id?"page":undefined}><span>{conversation.title}</span><small>{new Intl.DateTimeFormat("en-NG",{month:"short",day:"numeric"}).format(new Date(conversation.updatedAt))}</small></button>
+            <button type="button" className="chat-history-delete" onClick={event=>deleteConversation(event,conversation.id)} disabled={busy||historyLoading} title={t("Delete chat")} aria-label={`${t("Delete chat")}: ${conversation.title}`}><Trash2 size={15}/></button>
           </div>)}</div>}
-          <p className="chat-history-note">{t("Chats are saved on this browser only.")}</p>
+          {historyLoading&&<p className="chat-history-note" role="status">Loading chat history…</p>}
+          {historyError&&<p className="auth-message error" role="alert">{historyError}</p>}
+          <p className="chat-history-note">{user&&client?"Chats are backed up to your account and sync across devices.":"Chats are saved on this browser only."}</p>
         </aside>
     <div className="chat-shell card">
-      <div className="chat-top"><div className="ai-icon"><Bot size={21}/></div><div className="chat-identity"><strong>MBs Agro Solution</strong><span>Farm assistant · grounded, practical guidance</span></div><div className="chat-actions"><span className="online"><i/> Ready</span><button type="button" className="chat-reset" title={t("New chat")} aria-label={t("New chat")} onClick={startNewChat} disabled={busy}><Plus size={18}/></button></div></div>
+      <div className="chat-top"><div className="ai-icon"><Bot size={21}/></div><div className="chat-identity"><strong>MBs Agro Solution</strong><span>Farm assistant · grounded, practical guidance</span></div><div className="chat-actions"><span className="online"><i/> Ready</span><button type="button" className="chat-reset" title={t("New chat")} aria-label={t("New chat")} onClick={startNewChat} disabled={busy||historyLoading}><Plus size={18}/></button></div></div>
       <div className="messages" role="log" aria-live="polite" aria-label="Conversation">
         <div className="message-list">
           {messages.map((m,i)=><div key={i} className={`message ${m.role}`}><div className="message-avatar">{m.role==="ai"?<Sprout size={16}/>:<UserRound size={16}/>}</div><div className="message-content"><p>{m.text}</p>{m.fromApi&&<button className="alert-save" onClick={()=>onSaveRecommendation({id:m.id,text:m.text})}>{t("Save as alert")}</button>}{m.role==="ai" && i===0 && <div className="suggestions"><button onClick={()=>useSuggestion("Why are my maize leaves turning yellow?")}>🌽 Yellowing maize leaves</button><button onClick={()=>useSuggestion("How should I prepare for heavy rain?")}>🌧️ Heavy rain preparation</button><button onClick={()=>useSuggestion("My goat is not eating normally.")}>🐐 Livestock concern</button></div>}</div></div>)}
@@ -493,8 +681,8 @@ function AskAI({onSaveRecommendation}) {
       </div>
       <form className="chat-compose" onSubmit={event=>{event.preventDefault();send()}}>
         <button type="button" title="Open image diagnosis" aria-label="Open image diagnosis" onClick={()=>navigate("/diagnose")}><Camera size={18}/></button>
-        <input ref={composerRef} aria-label="Ask about your farm" value={input} onChange={e=>setInput(e.target.value)} placeholder="Message MBs Agro Solution..." />
-        <button className="send" type="submit" aria-label="Send message" disabled={busy||!input.trim()}><ArrowRight size={18}/></button>
+        <input ref={composerRef} aria-label="Ask about your farm" value={input} onChange={e=>setInput(e.target.value)} placeholder="Message MBs Agro Solution..." disabled={historyLoading} />
+        <button className="send" type="submit" aria-label="Send message" disabled={busy||historyLoading||!input.trim()}><ArrowRight size={18}/></button>
       </form>
       </div>
     </div>
@@ -821,7 +1009,7 @@ function Profile(){
        <label>Full name<input required maxLength={100} value={name} onChange={event=>setName(event.target.value)}/></label>
        <label>Email<input value={user.email||""} disabled/></label>
        <label>Date of birth<input type="date" value={profile.date_of_birth||""} disabled/></label>
-       <label>Gender<select value={profile.gender||""} disabled><option value="">Not provided</option><option value="female">Female</option><option value="male">Male</option><option value="non_binary">Non-binary</option><option value="prefer_not_to_say">Prefer not to say</option></select></label>
+       <label>Gender<select value={profile.gender||""} disabled><option value="">Not provided</option><option value="female">Female</option><option value="male">Male</option></select></label>
        <label>Region<input maxLength={100} value={region} onChange={event=>setRegion(event.target.value)} placeholder="e.g. Plateau State"/></label>
        <label>Farm location<input maxLength={180} value={farmLocation} onChange={event=>setFarmLocation(event.target.value)} placeholder="Town or local government"/></label>
        <label>AI knowledge level<select value={experience} onChange={event=>setExperience(event.target.value)}><option value="beginner">Beginner</option><option value="intermediate">Intermediate</option><option value="expert">Expert</option></select></label>
