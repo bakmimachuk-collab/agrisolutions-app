@@ -464,9 +464,9 @@ app.post("/api/chat", async (req, res) => {
     return res.status(400).json({ error: `Each message must be text no longer than ${maxMessageLength} characters.` });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  const apiKey = process.env.GEMINI_API_KEY?.trim() || process.env.VITE_GEMINI_API_KEY?.trim();
   if (!apiKey) {
-    return res.status(503).json({ error: "AI is not configured yet. Add GEMINI_API_KEY to your local .env file and restart the app." });
+    return res.status(503).json({ error: "AI is not configured yet. Add GEMINI_API_KEY or VITE_GEMINI_API_KEY to your local .env file and restart the app." });
   }
 
   try {
@@ -514,7 +514,7 @@ Do not claim certainty from limited information, and recommend a qualified local
         : status === 400
           ? "Gemini rejected the request. Check the configured model and chat request."
           : status === 401 || status === 403
-            ? "Gemini rejected the API key. Verify GEMINI_API_KEY in the server's .env file."
+            ? "Gemini rejected the API key. Verify GEMINI_API_KEY or VITE_GEMINI_API_KEY in the server's .env file."
             : "The AI service could not answer right now. Please try again."
     });
   }
