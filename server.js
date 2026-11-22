@@ -442,6 +442,13 @@ app.get("/api/admin/audit", requireAdminConfiguration, requireAdmin, asyncRoute(
   }
 }));
 
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    aiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim())
+  });
+});
+
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body ?? {};
   const language = req.body?.language ?? "en";
